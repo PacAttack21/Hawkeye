@@ -3,7 +3,7 @@
 # v1.3 — 4-phase pipeline (quick→quick+ext→full→full+ext), subdomain priority,
 #        link discovery, auth-aware, stacked TUI, clean artifacts.
 
-import argparse, dataclasses, hashlib, json, os, queue, re, shlex, signal, subprocess, sys, time
+import argparse, asyncio, dataclasses, hashlib, json, os, queue, re, shlex, signal, subprocess, sys, time
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +34,11 @@ try:
     import yaml
 except Exception:
     yaml = None
+
+try:
+    from pyppeteer import launch as pyppeteer_launch
+except Exception:
+    pyppeteer_launch = None
 
 # ---------- Constants ----------
 DEFAULT_CODES = "200,201,202,204,301,302,307,401,403"
@@ -352,10 +357,16 @@ class Hawkeye:
             self._print(f"[x] Missing required tools: {', '.join(miss)}")
             sys.exit(1)
         if self.args.screenshot_engine != "none":
-            ok = self._which(self.args.screenshot_engine if self.args.screenshot_engine!="eyewitness" else "EyeWitness")
-            if not ok:
-                self._print(f"[!] Screenshot engine '{self.args.screenshot_engine}' not found. Continuing without screenshots.")
-                self.args.screenshot_engine = "none"
+            if self.args.screenshot_engine == "pyppeteer":
+                if pyppeteer_launch is None:
+                    self._print("[!] Screenshot engine 'pyppeteer' unavailable (module missing). Continuing without screenshots.")
+                    self.args.screenshot_engine = "none"
+            else:
+                lookup = self.args.screenshot_engine if self.args.screenshot_engine != "eyewitness" else "EyeWitness"
+                ok = self._which(lookup)
+                if not ok:
+                    self._print(f"[!] Screenshot engine '{self.args.screenshot_engine}' not found. Continuing without screenshots.")
+                    self.args.screenshot_engine = "none"
 
     # ---- seeds ----
     def _add_seed_if_new(self, scheme: str, host: str, port: int, source: str) -> Optional[Seed]:
@@ -804,15 +815,67 @@ class Hawkeye:
 
     def _screenshot(self, url: str, out_path: Path) -> bool:
         eng = self.args.screenshot_engine
-        if eng != "gowitness": return False
-        cmd = ["gowitness","single","--url",url,"--timeout",str(self.args.screenshot_timeout),"--disable-logging","--screenshot-path",str(self.paths["shots"])]
-        try:
-            subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            pngs = sorted(self.paths["shots"].glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
-            if pngs:
-                out_path.write_bytes(pngs[0].read_bytes()); return True
-        except Exception: pass
+        if eng == "gowitness":
+            cmd = [
+                "gowitness",
+                "single",
+                "--url",
+                url,
+                "--timeout",
+                str(self.args.screenshot_timeout),
+                "--disable-logging",
+                "--screenshot-path",
+                str(self.paths["shots"]),
+            ]
+            try:
+                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False)
+                pngs = sorted(self.paths["shots"].glob("*.png"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if pngs:
+                    out_path.write_bytes(pngs[0].read_bytes())
+                    return True
+            except Exception:
+                return False
+            return False
+
+        if eng == "pyppeteer":
+            return self._screenshot_pyppeteer(url, out_path)
+
         return False
+
+    def _screenshot_pyppeteer(self, url: str, out_path: Path) -> bool:
+        if pyppeteer_launch is None:
+            return False
+
+        async def _capture() -> bool:
+            browser = await pyppeteer_launch(headless=True, args=["--no-sandbox", "--disable-gpu"])
+            try:
+                page = await browser.newPage()
+                await page.setViewport({"width": 1920, "height": 1080})
+                try:
+                    await page.goto(url, timeout=self.args.screenshot_timeout * 1000, waitUntil="networkidle2")
+                except Exception:
+                    await page.goto(url, timeout=self.args.screenshot_timeout * 1000, waitUntil="load")
+                await page.screenshot(path=str(out_path), fullPage=True)
+                return True
+            finally:
+                await browser.close()
+
+        try:
+            try:
+                running_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                running_loop = None
+
+            if running_loop is not None:
+                new_loop = asyncio.new_event_loop()
+                try:
+                    return new_loop.run_until_complete(_capture())
+                finally:
+                    new_loop.close()
+            else:
+                return asyncio.run(_capture())
+        except Exception:
+            return False
 
     # ---- outputs ----
     def _write_index_files(self):
@@ -879,7 +942,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--codes", default=DEFAULT_CODES)
     p.add_argument("--ffuf-timeout", dest="ffuf_timeout", type=int, default=7)
     # Capture / screenshots
-    p.add_argument("--screenshot-engine", choices=["gowitness","aquatone","eyewitness","none"], default="none")
+    p.add_argument("--screenshot-engine", choices=["gowitness","aquatone","eyewitness","pyppeteer","none"], default="none")
     p.add_argument("--screenshot-timeout", type=int, default=15)
     p.add_argument("--curl-timeout", type=int, default=15)
     # Auth / headers
