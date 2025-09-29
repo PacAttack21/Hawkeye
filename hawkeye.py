@@ -162,9 +162,28 @@ def guess_scheme(port: int, prefer_https: bool) -> str:
     return "https" if prefer_https else "http"
 
 def count_lines(path: Path) -> int:
+    """Count the number of lines in *path* efficiently.
+
+    The previous implementation iterated line-by-line in Python which is
+    noticeably slower for large wordlists.  Reading in larger binary chunks
+    lets us count newlines using highly optimised C code while keeping memory
+    usage low.
+    """
     try:
         with path.open("rb") as f:
-            return sum(1 for _ in f)
+            count = 0
+            ends_with_newline = True
+            had_bytes = False
+            while True:
+                chunk = f.read(1 << 15)  # 32 KiB chunks balance I/O and memory
+                if not chunk:
+                    break
+                had_bytes = True
+                ends_with_newline = chunk.endswith(b"\n")
+                count += chunk.count(b"\n")
+            if had_bytes and not ends_with_newline:
+                count += 1
+            return count
     except Exception:
         return 0
 
@@ -198,12 +217,18 @@ def detect_default_wordlist() -> Path:
     return fallback
 
 def crop_wordlist(src: Path, dst: Path, max_lines: int) -> int:
-    n = 0
+    if max_lines <= 0:
+        dst.write_bytes(b"")
+        return 0
+
+    written = 0
     with open(src, "rb") as fin, open(dst, "wb") as fout:
-        for n, line in enumerate(fin, 1):
+        for line in fin:
             fout.write(line)
-            if n >= max_lines: break
-    return n
+            written += 1
+            if written >= max_lines:
+                break
+    return written
 
 def root_domain_of(host: str) -> Optional[str]:
     # naive: keeps last two labels (domain.tld); good enough for CTF/HTB style
@@ -278,8 +303,17 @@ class Hawkeye:
         self.full_wordlist  = Path(args.dirs_wordlist).resolve() if args.dirs_wordlist else detect_default_wordlist()
         self.quick_wordlist = self.paths["lists"] / "quick.txt"
         self.quick_lines    = args.quick_lines
-        if not self.quick_wordlist.exists():
-            crop_wordlist(self.full_wordlist, self.quick_wordlist, self.quick_lines)
+
+        self.full_wordlist_lines = count_lines(self.full_wordlist)
+        target_quick_lines = min(self.quick_lines, self.full_wordlist_lines)
+
+        current_quick_lines = count_lines(self.quick_wordlist) if self.quick_wordlist.exists() else None
+        if current_quick_lines != target_quick_lines:
+            current_quick_lines = crop_wordlist(self.full_wordlist, self.quick_wordlist, target_quick_lines)
+
+        if current_quick_lines is None:
+            current_quick_lines = target_quick_lines
+        self.quick_wordlist_lines = current_quick_lines
 
         # progress counters
         self.words_done_global = 0
@@ -490,7 +524,12 @@ class Hawkeye:
         self.job_views.clear()
         self.visited.clear()
 
-        dirs_wl_lines = count_lines(wordlist)
+        if wordlist == self.quick_wordlist:
+            dirs_wl_lines = self.quick_wordlist_lines
+        elif wordlist == self.full_wordlist:
+            dirs_wl_lines = self.full_wordlist_lines
+        else:
+            dirs_wl_lines = count_lines(wordlist)
         baseline_sizes: Dict[str,int] = {}
 
         # capture roots to learn baseline sizes + ext hints
@@ -845,8 +884,8 @@ class Hawkeye:
             f"Elapsed: {elapsed}s",
             f"Seeds: {len(self.seeds)}",
             f"Findings: {len(self.findings)}",
-            f"quick_wordlist: {self.quick_wordlist} (lines: {count_lines(self.quick_wordlist)})",
-            f"full_wordlist : {self.full_wordlist} (lines: {count_lines(self.full_wordlist)})",
+            f"quick_wordlist: {self.quick_wordlist} (lines: {self.quick_wordlist_lines})",
+            f"full_wordlist : {self.full_wordlist} (lines: {self.full_wordlist_lines})",
             f"Results root: {self.root}",
         ]
         self.summary_txt.write_text("\n".join(lines) + "\n")
