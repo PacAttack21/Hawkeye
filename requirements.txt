@@ -1,0 +1,2 @@
+# Hawkeye v2.0 - Python Dependencies
+rich>=13.0.0
